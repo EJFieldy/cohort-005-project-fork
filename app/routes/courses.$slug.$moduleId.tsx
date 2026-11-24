@@ -12,7 +12,7 @@ import {
   users,
   LessonProgressStatus,
 } from "~/db/schema";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq, or, sql } from "drizzle-orm";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
@@ -101,8 +101,14 @@ function getModuleWithLessons(id: number) {
   const mod = db.select().from(modules).where(eq(modules.id, id)).get();
   if (!mod) return null;
 
+  // Anyone can load this page, so a lesson's body, video and code stay out.
   const moduleLessons = db
-    .select()
+    .select({
+      id: lessons.id,
+      title: lessons.title,
+      durationMinutes: lessons.durationMinutes,
+      hasVideo: sql<number>`${lessons.videoUrl} is not null and ${lessons.videoUrl} <> ''`,
+    })
     .from(lessons)
     .where(eq(lessons.moduleId, id))
     .orderBy(lessons.position)
@@ -358,7 +364,7 @@ export default function ModuleDetail({ loaderData }: Route.ComponentProps) {
             const status = lessonProgressMap[lesson.id];
             const isCompleted = status === LessonProgressStatus.Completed;
             const isInProgress = status === LessonProgressStatus.InProgress;
-            const hasVideo = !!lesson.videoUrl;
+            const hasVideo = !!lesson.hasVideo;
 
             const content = (
               <div className="flex items-center gap-3 rounded-md px-3 py-3 text-sm">

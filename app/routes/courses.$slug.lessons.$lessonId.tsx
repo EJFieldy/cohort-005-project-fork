@@ -17,14 +17,12 @@ import {
 } from "~/components/comment-thread";
 import { db } from "~/db";
 import {
-  bookmarks,
   categories,
   comments,
   courses,
   lessonProgress,
   lessons,
   modules,
-  notes,
   quizzes,
   quizQuestions,
   quizOptions,
@@ -59,7 +57,14 @@ import {
   Trophy,
   RotateCcw,
 } from "lucide-react";
-import { cn, formatDuration } from "~/lib/utils";
+import { cn, formatDuration, formatRelativeTime } from "~/lib/utils";
+import { NOTE_TOO_LONG, noteBodySchema } from "~/lib/bookmarks-and-notes";
+import {
+  getNote,
+  isBookmarked,
+  saveNote,
+  toggleBookmark,
+} from "~/lib/bookmarks-and-notes.server";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { YouTubePlayer } from "~/components/youtube-player";
 import { data, isRouteErrorResponse } from "react-router";
@@ -88,9 +93,9 @@ const editCommentSchema = z.object({
   body: z.string(),
 });
 
-// A note is capped at 2,000 characters, the same cap the spec sets.
 const saveNoteSchema = z.object({
-  body: z.string().trim().max(5000),
+  intent: z.literal("save-note"),
+  body: noteBodySchema,
 });
 
 const deleteCommentSchema = z.object({
@@ -189,8 +194,6 @@ function getUserById(id: number) {
   return db.select().from(users).where(eq(users.id, id)).get();
 }
 
-// Reads the learner's cached progress row for a lesson, falling back to the
-// progress service when the cache has not been warmed yet.
 function getLessonProgress(userId: number, lessonId: number) {
   return db
     .select()
@@ -233,8 +236,6 @@ function getLessonProgressForCourse(userId: number, courseId: number) {
     .all();
 }
 
-// Marks the lesson complete and recalculates the enrollment's stored
-// completion percentage in the same transaction.
 function markLessonComplete(userId: number, lessonId: number) {
   const existing = getLessonProgress(userId, lessonId);
 
@@ -262,7 +263,6 @@ function markLessonComplete(userId: number, lessonId: number) {
     .get();
 }
 
-// Called by the video player on every tick, so it has to stay cheap.
 function markLessonInProgress(userId: number, lessonId: number) {
   const existing = getLessonProgress(userId, lessonId);
 
@@ -287,67 +287,6 @@ function markLessonInProgress(userId: number, lessonId: number) {
     })
     .returning()
     .get();
-}
-
-function getBookmark(userId: number, lessonId: number) {
-  // Returns every bookmark the learner has on this lesson.
-  return db
-    .select()
-    .from(bookmarks)
-    .where(
-      and(eq(bookmarks.userId, userId), eq(bookmarks.lessonId, lessonId))
-    )
-    .get();
-}
-
-function toggleBookmark(userId: number, lessonId: number) {
-  const existing = getBookmark(userId, lessonId);
-
-  if (existing) {
-    // Insert the bookmark.
-    db.delete(bookmarks).where(eq(bookmarks.id, existing.id)).run();
-    return false;
-  }
-
-  db.insert(bookmarks).values({ userId, lessonId }).run();
-  return true;
-}
-
-function getNote(userId: number, lessonId: number) {
-  // Notes are ordered newest first.
-  return db
-    .select()
-    .from(notes)
-    .where(and(eq(notes.userId, userId), eq(notes.lessonId, lessonId)))
-    .get();
-}
-
-function saveNote(userId: number, lessonId: number, body: string) {
-  const existing = getNote(userId, lessonId);
-  const now = new Date().toISOString();
-
-  if (existing) {
-    // Create the note row.
-    return db
-      .update(notes)
-      .set({ body, updatedAt: now })
-      .where(eq(notes.id, existing.id))
-      .returning()
-      .get();
-  }
-
-  return db
-    .insert(notes)
-    .values({ userId, lessonId, body, createdAt: now, updatedAt: now })
-    .returning()
-    .get();
-}
-
-function deleteNote(userId: number, lessonId: number) {
-  // Soft-deletes the note so the learner can undo it.
-  db.delete(notes)
-    .where(and(eq(notes.userId, userId), eq(notes.lessonId, lessonId)))
-    .run();
 }
 
 function getLastWatchPosition(userId: number, lessonId: number) {
@@ -766,17 +705,22 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ? await renderThread(getLessonThread(lessonId))
     : [];
 
-  // The learner's own bookmark and note for this lesson. Both are per-learner,
-  // so a signed-out visitor gets neither.
-  const bookmarked = currentUserId
-    ? !!getBookmark(currentUserId, lessonId)
-    : false;
-  const note = currentUserId ? getNote(currentUserId, lessonId) : undefined;
+  // The current person's own Bookmark and Note, behind the same bar as the
+  // discussion. Nobody else's are ever read here.
+  const bookmarked =
+    currentUserId && canViewContent
+      ? isBookmarked(db, currentUserId, lessonId)
+      : false;
+  const note =
+    currentUserId && canViewContent
+      ? getNote(db, currentUserId, lessonId)
+      : null;
 
   // Render lesson content from Markdown to HTML server-side
-  const contentHtml = lesson.content
-    ? await renderMarkdown(lesson.content)
-    : null;
+  const contentHtml =
+    canViewContent && lesson.content
+      ? await renderMarkdown(lesson.content)
+      : null;
 
   // Build prev/next navigation
   const allLessons = flattenCourseLessons(courseWithDetails);
@@ -786,7 +730,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     currentIndex < allLessons.length - 1 ? allLessons[currentIndex + 1] : null;
 
   // Check for quiz attached to this lesson
-  const quizRecord = getQuizByLessonId(lessonId);
+  const quizRecord = canViewContent ? getQuizByLessonId(lessonId) : undefined;
   let quiz: {
     id: number;
     title: string;
@@ -848,7 +792,15 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       id: mod.id,
       title: mod.title,
     },
-    lesson,
+    // Listed field by field: the lesson's body, video and code are content, and
+    // anything returned here reaches the browser whether or not it is rendered.
+    lesson: {
+      id: lesson.id,
+      title: lesson.title,
+      durationMinutes: lesson.durationMinutes,
+      videoUrl: canViewContent ? lesson.videoUrl : null,
+      githubRepoUrl: canViewContent ? lesson.githubRepoUrl : null,
+    },
     contentHtml,
     lessonStatus,
     enrolled,
@@ -868,9 +820,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     canModerate: access.isStaff,
     instructorName: instructor?.name ?? "your instructor",
     bookmarked,
-    note: note
-      ? { body: note.body, updatedAt: note.updatedAt }
-      : null,
+    note,
   };
 }
 
@@ -885,6 +835,14 @@ export async function action({ params, request }: Route.ActionArgs) {
   const currentUserId = await getCurrentUserId(request);
   if (!currentUserId) {
     throw data("You must be logged in", { status: 401 });
+  }
+
+  // Access is checked against the course in the URL, so the lesson has to
+  // belong to it. Otherwise access to one course reaches another's lessons.
+  const lesson = getLessonById(lessonId);
+  const mod = lesson && getModuleById(lesson.moduleId);
+  if (!mod || mod.courseId !== course.id) {
+    throw data("Lesson not found in this course", { status: 404 });
   }
 
   const formData = await request.formData();
@@ -968,31 +926,36 @@ export async function action({ params, request }: Route.ActionArgs) {
     }
   }
 
-  if (intent === "toggle-bookmark") {
-    const nowBookmarked = toggleBookmark(currentUserId, lessonId);
-    return { ok: true, bookmarked: nowBookmarked };
-  }
+  // Bookmarks and Notes follow the same bar as the discussion, re-checked here
+  // for the same reason.
+  if (intent === "toggle-bookmark" || intent === "save-note") {
+    await requireContentAccess(request, course.id);
 
-  if (intent === "save-note") {
+    if (intent === "toggle-bookmark") {
+      const bookmarked = toggleBookmark(
+        db,
+        currentUserId,
+        lessonId,
+        new Date()
+      );
+      return { ok: true, bookmarked };
+    }
+
     const parsed = parseFormData(formData, saveNoteSchema);
     if (!parsed.success) {
-      return { ok: false, error: "That note is too long to save." };
+      throw data(parsed.errors.body ?? "Could not save that note.", {
+        status: 400,
+      });
     }
-
-    const lesson = getLessonById(lessonId);
-    if (!lesson) {
-      // Nothing to hang the note off, so tell the form rather than the user.
-      return { ok: false, error: "Lesson not found." };
-    }
-
-    // An empty box means the learner cleared their note.
-    if (parsed.data.body.length === 0) {
-      deleteNote(currentUserId, lessonId);
-      return { ok: true, noteSaved: true };
-    }
-
-    saveNote(currentUserId, lessonId, parsed.data.body);
-    return { ok: true, noteSaved: true };
+    const saved = saveNote(
+      db,
+      currentUserId,
+      lessonId,
+      parsed.data.body,
+      new Date()
+    );
+    if (!saved.ok) throw data(saved.error, { status: 400 });
+    return { ok: true };
   }
 
   if (intent === "mark-complete") {
@@ -1105,6 +1068,11 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     }
   }, [justCompleted, nextLesson, course.slug, navigate]);
 
+  const showBookmarkAndNote = enrolled && canViewContent;
+  // Remounts the controls when the Student or the Lesson changes, so unsaved
+  // Note text can't carry over and be saved somewhere else.
+  const ownerKey = `${currentUserId}-${lesson.id}`;
+
   const quizResult = quizFetcher.data?.quizResult ?? null;
   const isSubmittingQuiz = quizFetcher.state !== "idle";
 
@@ -1183,16 +1151,18 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
 
         <div className="mx-auto max-w-4xl">
           {/* Lesson Title */}
-          <h1 className="mb-2 text-3xl font-bold">{lesson.title}</h1>
+          <div className="mb-2 flex items-start justify-between gap-3">
+            <h1 className="text-3xl font-bold">{lesson.title}</h1>
+            {showBookmarkAndNote && (
+              <BookmarkToggle key={ownerKey} bookmarked={bookmarked} />
+            )}
+          </div>
           <div className="mb-6 flex items-center gap-3">
             {lesson.durationMinutes && (
               <div className="flex items-center gap-1 text-sm text-muted-foreground">
                 <Clock className="size-4" />
                 {formatDuration(lesson.durationMinutes, true, false, false)}
               </div>
-            )}
-            {enrolled && currentUserId && (
-              <BookmarkToggle bookmarked={bookmarked} />
             )}
             {lesson.githubRepoUrl && (
               <a
@@ -1223,6 +1193,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
             />
           )}
 
+          {/* Note */}
+          {showBookmarkAndNote && <LessonNote key={ownerKey} note={note} />}
+
           {/* Lesson Content */}
           {contentHtml && (
             <div
@@ -1231,16 +1204,26 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
             />
           )}
 
-          {!contentHtml && !lesson.videoUrl && (
+          {!canViewContent && (
+            <Card className="mb-8">
+              <CardContent className="space-y-4 py-12 text-center">
+                <p className="text-muted-foreground">
+                  You need to be enrolled in this course to see this lesson.
+                </p>
+                <Link to={`/courses/${course.slug}`}>
+                  <Button>View course</Button>
+                </Link>
+              </CardContent>
+            </Card>
+          )}
+
+          {canViewContent && !contentHtml && !lesson.videoUrl && (
             <Card className="mb-8">
               <CardContent className="py-12 text-center text-muted-foreground">
                 No content has been added to this lesson yet.
               </CardContent>
             </Card>
           )}
-
-          {/* Notes */}
-          {enrolled && currentUserId && <LessonNote note={note} />}
 
           {/* Quiz Section */}
           {quiz && enrolled && currentUserId && (
@@ -1364,11 +1347,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
 }
 
 function BookmarkToggle({ bookmarked }: { bookmarked: boolean }) {
-  const fetcher = useFetcher<{ ok: boolean }>();
+  const fetcher = useFetcher();
   const isSaving = fetcher.state !== "idle";
 
-  // Optimistic — the button flips the moment it is pressed, before the server
-  // has answered.
   return (
     <fetcher.Form method="post">
       <input type="hidden" name="intent" value="toggle-bookmark" />
@@ -1389,33 +1370,51 @@ function LessonNote({
 }: {
   note: { body: string; updatedAt: string } | null;
 }) {
-  const fetcher = useFetcher<{ ok: boolean; error?: string }>();
+  const fetcher = useFetcher();
   const isSaving = fetcher.state !== "idle";
-  const error = fetcher.data?.error;
+  const [body, setBody] = useState(note?.body ?? "");
+  // Caught here so an over-long Note is refused without losing what was typed.
+  // The action refuses it too.
+  const tooLong = !noteBodySchema.safeParse(body).success;
 
   return (
     <Card className="mb-8">
       <CardContent className="space-y-3 pt-6">
         <div className="flex items-center gap-2">
           <NotebookPen className="size-4 text-muted-foreground" />
-          <h2 className="font-semibold">Your notes</h2>
+          <h2 className="font-semibold">Your note</h2>
         </div>
 
         <fetcher.Form method="post" className="space-y-3">
           <input type="hidden" name="intent" value="save-note" />
-          {/* Notes are rendered as Markdown once saved. */}
           <Textarea
             name="body"
             rows={6}
-            defaultValue={note?.body ?? ""}
+            value={body}
+            onChange={(event) => setBody(event.target.value)}
+            aria-label="Your note"
+            aria-invalid={tooLong}
             placeholder="Only you can read this."
             className="resize-y"
           />
           <div className="flex items-center gap-3">
-            <Button type="submit" size="sm" disabled={isSaving}>
+            <Button type="submit" size="sm" disabled={isSaving || tooLong}>
               {isSaving ? "Saving..." : "Save note"}
             </Button>
-            {error && <span className="text-sm text-red-600">{error}</span>}
+            {tooLong ? (
+              <span role="alert" className="text-sm text-red-600">
+                {NOTE_TOO_LONG}
+              </span>
+            ) : (
+              note && (
+                <span
+                  suppressHydrationWarning
+                  className="text-xs text-muted-foreground"
+                >
+                  Last edited {formatRelativeTime(note.updatedAt)}
+                </span>
+              )
+            )}
           </div>
         </fetcher.Form>
       </CardContent>
