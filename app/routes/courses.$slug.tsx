@@ -97,8 +97,15 @@ function getCourseWithDetails(id: number) {
 
   const courseLessons =
     moduleIds.length > 0
-      ? db
-          .select()
+      ? // Anyone can load this page, so a lesson's body, video and code stay out.
+        db
+          .select({
+            id: lessons.id,
+            moduleId: lessons.moduleId,
+            title: lessons.title,
+            position: lessons.position,
+            durationMinutes: lessons.durationMinutes,
+          })
           .from(lessons)
           .where(or(...moduleIds.map((mid) => eq(lessons.moduleId, mid)))!)
           .orderBy(lessons.position)

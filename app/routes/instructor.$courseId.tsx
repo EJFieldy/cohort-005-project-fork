@@ -24,6 +24,8 @@ import {
   quizAttempts,
 } from "~/db/schema";
 import { eq, and, or, sql, desc, gt, gte } from "drizzle-orm";
+import { deleteLesson, deleteModule } from "~/lib/lesson-deletion.server";
+import { defaultNotifications } from "~/lib/notifications.server";
 import { formatDuration, formatPrice } from "~/lib/utils";
 import { MonacoMarkdownEditor } from "~/components/monaco-markdown-editor";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
@@ -233,12 +235,6 @@ function updateModuleTitle(id: number, title: string) {
     .get();
 }
 
-function deleteModule(id: number) {
-  // Delete all lessons in this module first
-  db.delete(lessons).where(eq(lessons.moduleId, id)).run();
-  return db.delete(modules).where(eq(modules.id, id)).returning().get();
-}
-
 function reorderModules(courseId: number, moduleIds: number[]) {
   for (let i = 0; i < moduleIds.length; i++) {
     db.update(modules)
@@ -299,10 +295,6 @@ function updateLessonTitle(id: number, title: string) {
     .where(eq(lessons.id, id))
     .returning()
     .get();
-}
-
-function deleteLesson(id: number) {
-  return db.delete(lessons).where(eq(lessons.id, id)).returning().get();
 }
 
 function reorderLessons(moduleId: number, lessonIds: number[]) {
@@ -746,7 +738,7 @@ export async function action({ params, request }: Route.ActionArgs) {
         { status: 404 }
       );
     }
-    deleteModule(moduleId);
+    await deleteModule(db, moduleId, await defaultNotifications());
     return { success: true, field: "module" };
   }
 
@@ -837,7 +829,7 @@ export async function action({ params, request }: Route.ActionArgs) {
         { status: 404 }
       );
     }
-    deleteLesson(lessonId);
+    await deleteLesson(db, lessonId, await defaultNotifications());
     return { success: true, field: "lesson" };
   }
 
